@@ -74,23 +74,25 @@ int main(int argc, char *argv[])
   tcflush(fd, TCOFLUSH);
 
   while(fgets(inbuf, 256 , stdin) != NULL) {
+    inbuf[strcspn(inbuf, "\n")] = 0;
     crc = cal_crc_half((INT8U *) inbuf, (INT8U)strlen(inbuf));
     sprintf(outbuf, "%s%c%c\r", inbuf, 0xff & (crc >> 8), 0xff & crc);
     len = strlen(inbuf) + 3;
 
-    printf("Writing '");
+    /*printf("Writing '");
     for (int i = 0; i < len; i++) {
       if (i > 0) printf(":");
       printf("%02X", (unsigned char) outbuf[i]);
     }
-    printf("'\n");
+    printf("'\n");*/
 
     if (write(fd, outbuf, len) < len) {
         printf("failed to write (1)\n");
         exit(1);
     }
-    printf("Wrote the output OK, waiting for input...\n");
+    //printf("Wrote the output OK, waiting for input...\n");
     ch = inbuf;
+    *ch = 0;
 
     for(;;) {
       result = read(fd, ch, 1);
@@ -101,11 +103,11 @@ int main(int argc, char *argv[])
       if(*ch == '\r' || *ch == '\n') {
         ch -= 2;
         *ch = 0;
-        printf("\n");
         break;
       }
+      ch++;
     }
-    printf("%s\n", inbuf);
+    printf("%s\n", inbuf+1);
   }
   return 0;
 }
