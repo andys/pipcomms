@@ -1,0 +1,8 @@
+
+This project is just a simple way to communicate with the MPP Solar PIP unit.
+
+Takes commands from STDIN and relays them to the unit with appropriate CRC
+and escaping, and prints the results back to STDOUT.
+
+Compile with `gcc pip.c -O -o pip`, then run with `sudo ./pip`.  Talks on
+/dev/ttyUSB0.
