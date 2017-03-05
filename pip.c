@@ -47,19 +47,22 @@ uint16_t cal_crc_half(uint8_t *pin, uint8_t len)
   return(crc);
 }
 
-
 int main(int argc, char *argv[])
 {
   int fd, result, len, retries;
   uint16_t crc;
-  char port[] = "/dev/ttyUSB0";
   unsigned char inbuf[256], outbuf[256];
   unsigned char *ch, cr = '\n';
   speed_t baud = B2400;
   /*fd_set listen_fds;
   struct timeval timeout;*/
 
-  fd = open(port, O_RDWR | O_NONBLOCK);
+  if(argc != 2) {
+    printf("ERROR: please supply serial port path (eg. /dev/ttyUSB0) as argument\n");
+    return 3;
+  }
+
+  fd = open(argv[1], O_RDWR | O_NONBLOCK);
 
   struct termios settings;
   tcgetattr(fd, &settings);

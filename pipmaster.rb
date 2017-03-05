@@ -1,12 +1,53 @@
 require 'net/http'
 require 'uri'
 require 'concurrent'
+require 'json'
 
 $temp = nil
+$bms = {}
+$lastbms = 0
 
 @status = []
+@bms_status = []
 @posts = []
+
+@user_commands = []
 @commands = []
+
+Thread.new do
+	loop do
+		sleep 5
+		begin
+                        device = Dir['/dev/ttyACM*'].first
+			IO.popen("sudo ./usbtin #{device}", "r+") do |f|
+				loop do
+					#f.flush
+					# CAN message { id = 0x1f4  len = 8 [ 00 33 10 02 8c 7f 15 00]}
+					#if canmsg =~ /CAN message { id = 0x1f4 .* \[ ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af])\]}/
+					
+					canmsg = f.gets
+					canmsg.chomp! if canmsg
+					if canmsg =~ /^t1F48([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})/
+						bms = {
+							time: Time.now.to_f.round(1),
+							bms_errors: $1.to_i(16),
+							soc: $2.to_i(16),
+							bms_v: ($4+$3).to_i(16) * 0.1,
+							bms_a: (($6+$5).to_i(16) - 32768) * 0.1,
+							bms_temp: $7.to_i(16)
+						}
+						$bms = bms
+						$lastbms = Time.now.to_i
+						@bms_status << bms
+					end
+				end
+			end
+		rescue Exception => e
+                        puts e
+                        puts e.backtrace.join("\n -> ")
+		end
+	end
+end
 
 Thread.new do
 	loop do
@@ -31,9 +72,10 @@ end
 
 Thread.new do
 	loop do
-		sleep 1
+		sleep 3
 		begin
-			IO.popen("sudo ./pip", "r+") do |f|
+			device = Dir['/dev/ttyUSB*'].first
+			IO.popen("sudo ./pip #{device}", "r+") do |f|
 				loop do
 					if(cmd = @commands.shift)
 						response = ''
@@ -45,6 +87,14 @@ Thread.new do
 							puts "    <- #{response.inspect}"
 							sleep 0.2
 						end
+					end
+					if(cmd = @user_commands.shift)
+						response = ''
+						puts "CMD:-> #{cmd.inspect}"
+						f.puts cmd
+						f.flush
+						response = f.gets.chomp
+						puts "    <- #{response.inspect}"
 					end
 					sleep 0.8
 					f.puts "QPIGS"
@@ -80,6 +130,11 @@ Thread.new do
 					status[:bat_w_charge] = (status[:ac_w] - status[:pv_w]).round(0)
 					status[:bat_w_discharge] = ((status[:bat_discharge_a].to_f * status[:bat_v]) - (status[:bat_charge_a].to_f * status[:bat_charge_v])).round(0)
 					status[:temp] = $temp if $temp
+					status[:bms_temp] = $bms[:bms_temp] if $bms[:bms_temp]
+					status[:bms_v] = $bms[:bms_v].round(1) if $bms[:bms_v]
+					status[:bms_a] = $bms[:bms_a].round(1) if $bms[:bms_a]
+					status[:bms_errors] = $bms[:bms_errors] if $bms[:bms_errors]
+					status[:soc] = "#{$bms[:soc]}%" if $bms[:soc]
 					@status << status
 				end
 			end
@@ -100,7 +155,7 @@ Thread.new do
 				hours =  (@status[-1][:time] - @status[-2][:time]) / 3600.0
 			end
 			
-			puts latest.to_s
+			puts latest.to_json.gsub(/,/, ', ')
 		end
 		sleep 0.3
 	}
@@ -112,6 +167,9 @@ class Array
 	end
 	def avg
 		sum.to_f / length.to_f
+	end
+	def without_outlier
+		self.select {|f| f >= max }
 	end
 	def field(fieldname)
 		map {|h| h[fieldname] }.compact
@@ -129,13 +187,42 @@ Thread.new do
 				watts = last_readings.field(:bat_w_charge).avg
 				watts = watts < 0 ? -watts : 0
 				avg_amps = watts / avg_volt
-				puts "battery charge state:  avg_volt=#{avg_volt.round(2)} avg_amps=#{avg_amps.round(2)}"
+				puts "PIP: avg_volt=#{avg_volt.round(1)} avg_amps=#{avg_amps.round(1)}"
 				if avg_volt >= 56.05 && avg_amps <= 10.0
-					puts "Charge completion detected!"
-					@commands << 'PBFT53.9'
+					puts "Charge completion detected (PIP)!"
+					@commands << 'PBFT53.7'
 					sleep 60
 				end
 			end
+			if(Time.now.to_i - $lastbms > 10)
+				$bms = {}
+			end
+			last_readings = @bms_status[-70..-1]
+			if last_readings && last_readings.length==70
+				avg_volt = last_readings.field(:bms_v).without_outlier.avg
+				avg_amps = -last_readings.field(:bms_a).avg
+				if avg_amps > 0
+					puts "BMS: avg_volt=#{avg_volt.round(1)} avg_amps=#{avg_amps.round(1)}"
+					if avg_volt >= 56.00 && avg_amps <= 10.0
+						puts "Charge completion detected (BMS)!"
+						@commands << 'PBFT53.7'
+						sleep 60
+					end
+					soc = last_readings.field(:soc).min
+					if soc && soc >= 99
+#						puts "Charge completion detected (SoC)!"
+#						@commands << 'PBFT53.7'
+#						sleep 60
+					end
+
+				end
+			end
+			if Time.now.hour == 0 && Time.now.min == 0
+				puts "Midnight detected - resetting"
+				@commands << 'PBFT56.1'
+				sleep 60
+			end
+
 	        rescue Exception => e
 	                puts e
 	                puts e.backtrace.join("\n -> ")
@@ -166,8 +253,10 @@ def post(array)
 		'v6' => array.field(:pv_v).avg.round(1),
 		'v7' => v7,
 		'v8' => v8,
-		'v9' => array.field(:bat_v).min.round(1),
-		'v10'=> array.field(:bat_v).max.round(1)
+		'v9' => @bms_status.field(:bms_v).without_outlier.avg.round(1),
+		'v10'=> @bms_status.field(:soc).without_outlier.last,
+		'v11'=> @bms_status.field(:bms_temp).without_outlier.avg.round(1),
+		'v12'=> @bms_status.field(:errors).max
 	}
 	puts data
 	authdata = { 'X-Pvoutput-Apikey' => 'c30eccc114b0acd3821cb48cb0028befac9bd459', 'X-Pvoutput-SystemId' => '48029' }
@@ -180,15 +269,25 @@ end
 
 interval = 300
 
-loop do
-	sleep(1 + interval - (Time.now.to_i % interval))
-	begin
-		datalist = []
-		datalist << @status.shift until(@status.empty?)
-		post(datalist)
-		
-	rescue Exception => e
-		 puts e
-		puts e.backtrace.join("\n -> ")
+Thread.new do
+	loop do
+		sleep(1 + interval - (Time.now.to_i % interval))
+		begin
+			datalist = []
+			datalist << @status.shift until(@status.empty?)
+			post(datalist)
+			@bms_status = @bms_status[-50..-1]
+		rescue Exception => e
+			 puts e
+			puts e.backtrace.join("\n -> ")
+		end
 	end
+end
+
+loop do
+	input = $stdin.gets.chomp
+	if input =~ /^Q.+/ || input =~ /^P.+/ || input =~ /^M.+/
+		@user_commands << input
+	end
+	input = nil
 end
