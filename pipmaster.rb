@@ -10,6 +10,7 @@ $lastbms = 0
 @status = []
 @bms_status = []
 @posts = []
+$fastcharge = true
 
 @user_commands = []
 @commands = []
@@ -127,7 +128,11 @@ Thread.new do
 					}
 					status[:pv_w] = (status[:pv_a] * status[:bat_charge_v]).round(0)
 					status[:cell_v] = (status[:bat_v] / 16.0).round(2)
-					status[:bat_w_charge] = (status[:ac_w] - status[:pv_w]).round(0)
+					status[:bat_w_charge] = if status[:grid_v] > 1
+							-(status[:bat_charge_a].to_f * status[:bat_charge_v].to_f).round(0)
+						else
+							(status[:ac_w] - status[:pv_w]).round(0)
+						end
 					status[:bat_w_discharge] = ((status[:bat_discharge_a].to_f * status[:bat_v]) - (status[:bat_charge_a].to_f * status[:bat_charge_v])).round(0)
 					status[:temp] = $temp if $temp
 					status[:bms_temp] = $bms[:bms_temp] if $bms[:bms_temp]
@@ -168,8 +173,11 @@ class Array
 	def avg
 		sum.to_f / length.to_f
 	end
-	def without_outlier
-		self.select {|f| f >= max }
+	def median
+		sort[length.div(2)]
+	end
+	def without_outlier(m = max)
+		self.select {|f| f.abs <= m }
 	end
 	def field(fieldname)
 		map {|h| h[fieldname] }.compact
@@ -190,6 +198,7 @@ Thread.new do
 				puts "PIP: avg_volt=#{avg_volt.round(1)} avg_amps=#{avg_amps.round(1)}"
 				if avg_volt >= 56.05 && avg_amps <= 10.0
 					puts "Charge completion detected (PIP)!"
+					$fastcharge = false
 					@commands << 'PBFT53.7'
 					sleep 60
 				end
@@ -199,26 +208,37 @@ Thread.new do
 			end
 			last_readings = @bms_status[-70..-1]
 			if last_readings && last_readings.length==70
-				avg_volt = last_readings.field(:bms_v).without_outlier.avg
-				avg_amps = -last_readings.field(:bms_a).avg
+				avg_volt = last_readings.field(:bms_v).without_outlier(63.0).median
+				avg_amps = -last_readings.field(:bms_a).without_outlier(300.0).median
 				if avg_amps > 0
 					puts "BMS: avg_volt=#{avg_volt.round(1)} avg_amps=#{avg_amps.round(1)}"
 					if avg_volt >= 56.00 && avg_amps <= 10.0
 						puts "Charge completion detected (BMS)!"
 						@commands << 'PBFT53.7'
+						$fastcharge = false
 						sleep 60
 					end
-					soc = last_readings.field(:soc).min
-					if soc && soc >= 99
-#						puts "Charge completion detected (SoC)!"
-#						@commands << 'PBFT53.7'
-#						sleep 60
+				end
+				soc = last_readings.field(:soc).without_outlier(100.1).median
+				if soc
+					puts "BMS: SoC=#{soc} fastcharge=#{$fastcharge.inspect}"
+					#if soc >= 98 && $fastcharge
+					#	puts "Charge completion detected (SoC)!"
+					#	@commands << 'PBFT53.7'
+					#	$fastcharge = false
+					#	sleep 60
+					#els
+					if soc <= 95 && !$fastcharge
+						puts "SoC dropped - reinstating fast charge mode!"
+						@commands << 'PBFT56.1'
+						$fastcharge = true
+						sleep 60
 					end
-
 				end
 			end
 			if Time.now.hour == 0 && Time.now.min == 0
 				puts "Midnight detected - resetting"
+				$fastcharge = true
 				@commands << 'PBFT56.1'
 				sleep 60
 			end
@@ -253,9 +273,9 @@ def post(array)
 		'v6' => array.field(:pv_v).avg.round(1),
 		'v7' => v7,
 		'v8' => v8,
-		'v9' => @bms_status.field(:bms_v).without_outlier.avg.round(1),
-		'v10'=> @bms_status.field(:soc).without_outlier.last,
-		'v11'=> @bms_status.field(:bms_temp).without_outlier.avg.round(1),
+		'v9' => @bms_status.field(:bms_v).without_outlier(63.0).median.round(1),
+		'v10'=> @bms_status.field(:soc).without_outlier(100.1).median,
+		'v11'=> @bms_status.field(:bms_temp).without_outlier(80.0).median.round(1),
 		'v12'=> @bms_status.field(:errors).max
 	}
 	puts data
