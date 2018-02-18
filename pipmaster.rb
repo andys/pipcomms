@@ -6,6 +6,9 @@ require 'json'
 $temp = nil
 $bms = {}
 $lastbms = 0
+CAPACITY_AH = 160
+
+FLOAT_V = '53.7'
 
 @status = []
 @bms_status = []
@@ -14,6 +17,7 @@ $fastcharge = true
 
 @user_commands = []
 @commands = []
+
 
 Thread.new do
 	loop do
@@ -25,7 +29,7 @@ Thread.new do
 					#f.flush
 					# CAN message { id = 0x1f4  len = 8 [ 00 33 10 02 8c 7f 15 00]}
 					#if canmsg =~ /CAN message { id = 0x1f4 .* \[ ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af]) ([0-9af][0-9af])\]}/
-					
+					#"bms_temp":40, "bms_v":129.6, "bms_a":3250.4, "bms_errors":0, "soc":"99%"}
 					canmsg = f.gets
 					canmsg.chomp! if canmsg
 					if canmsg =~ /^t1F48([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})/
@@ -37,9 +41,20 @@ Thread.new do
 							bms_a: (($6+$5).to_i(16) - 32768) * 0.1,
 							bms_temp: $7.to_i(16)
 						}
-						$bms = bms
-						$lastbms = Time.now.to_i
-						@bms_status << bms
+						$bms = bms if $bms.empty?
+						bms.delete(:bms_temp) if bms[:bms_temp] >= 80 || bms[:bms_temp] <= 0
+						if bms[:bms_errors] > 0
+							puts "!! WARNING !!  got bms_error = #{bms[:bms_errors]}"
+						elsif(bms[:soc] - $bms[:soc]).abs > 2 ||
+						  (bms[:bms_v] >= 70) || (bms[:bms_v] < 40) ||
+						  (bms[:bms_a] >= 1000) || (bms[:bms_a] < -1000) ||
+						  (bms[:soc] > 100)
+							puts "Ignoring nonsensical BMS values: #{bms.to_json}\n  previous = #{$bms.to_json}"
+						else
+							$bms = bms
+							$lastbms = Time.now.to_i
+							@bms_status << bms
+						end
 					end
 				end
 			end
@@ -119,7 +134,7 @@ Thread.new do
 						bus_v: fields[7].to_i,
 						bat_v: fields[8].to_f,
 						bat_charge_a: fields[9].to_f,
-						bat_cap_pct: fields[10].to_i,
+						#bat_cap_pct: fields[10].to_i, # useless field
 						heatsink_temp: fields[11].to_i,
 						pv_a: fields[12].to_i,
 						pv_v: fields[13].to_f,
@@ -199,7 +214,7 @@ Thread.new do
 				if avg_volt >= 56.05 && avg_amps <= 10.0
 					puts "Charge completion detected (PIP)!"
 					$fastcharge = false
-					@commands << 'PBFT53.7'
+					@commands << "PBFT#{FLOAT_V}"
 					sleep 60
 				end
 			end
@@ -208,20 +223,29 @@ Thread.new do
 			end
 			last_readings = @bms_status[-70..-1]
 			if last_readings && last_readings.length==70
-				avg_volt = last_readings.field(:bms_v).without_outlier(63.0).median
-				avg_amps = -last_readings.field(:bms_a).without_outlier(300.0).median
-				if avg_amps > 0
-					puts "BMS: avg_volt=#{avg_volt.round(1)} avg_amps=#{avg_amps.round(1)}"
-					if avg_volt >= 56.00 && avg_amps <= 10.0
+				med_volt = last_readings.field(:bms_v).without_outlier(63.0).median
+				med_amps = -last_readings.field(:bms_a).without_outlier(300.0).median
+				avg_amps = -last_readings.field(:bms_a).without_outlier(med_amps.abs * 2).avg
+				if med_amps > 0
+					puts "BMS: med_volt=#{med_volt.round(1)} avg_amps=#{avg_amps.round(1)} med_amps=#{med_amps.round(1)}"
+					if med_volt >= 56.00 && med_amps <= 9.0
 						puts "Charge completion detected (BMS)!"
-						@commands << 'PBFT53.7'
+						@commands << "PBFT#{FLOAT_V}"
 						$fastcharge = false
 						sleep 60
 					end
 				end
 				soc = last_readings.field(:soc).without_outlier(100.1).median
 				if soc
-					puts "BMS: SoC=#{soc} fastcharge=#{$fastcharge.inspect}"
+					required_ah = ((100.0 - soc) / 100.0) * CAPACITY_AH.to_f
+
+					ttf = if avg_amps.to_i == 0
+						0.0
+					else
+						required_ah / avg_amps.to_f
+					end
+
+					puts "BMS: SoC=#{soc} fastcharge=#{$fastcharge.inspect} required=#{(required_ah * 0.053).round(1)}kWh eta=#{Time.at(Time.now.to_f + ttf * 3600.0).strftime('%H:%M')}"
 					#if soc >= 98 && $fastcharge
 					#	puts "Charge completion detected (SoC)!"
 					#	@commands << 'PBFT53.7'
